@@ -1,0 +1,303 @@
+# Iteration 2 retrospective — backend + single agent + streaming
+
+## What worked smoothly
+
+- **`Engine.fastapi_app(extra_routers=[...])` is the right shape.** Wiring a
+  real app took ~10 lines: build a repo, build a runner, hand both routers
+  to the factory. Lifespan / `app.state.container` / `/healthz` come for
+  free.
+- **`InMemoryThreadRepository` is a complete drop-in.** No subclassing, no
+  override gymnastics — the `ThreadRepository` Protocol means I can later
+  swap to Postgres without touching the routers.
+- **The `StreamEvent` + `StreamEncoder` split is clean.** `agent_runner`
+  speaks the protocol-neutral `StreamEvent`, the framework's `AGUIEncoder`
+  turns it into SSE frames. Iteration 3's frontend can pick `ag-ui` or
+  `vercel` via `?protocol=` with zero changes here.
+- **`Engine(providers=[])` is legal.** Iteration 2 wants no DBOS / no
+  Postgres, and the framework didn't fight that — empty provider list +
+  `fastapi_app()` boots cleanly.
+- **`get_tenant_id` already does the `X-Tenant-Id`-header thing.** No need
+  to write tenant middleware just to satisfy the threads router.
+
+## Friction points (framework ergonomics gaps)
+
+1. **No built-in pydantic-ai → `StreamEvent` adapter.** Every consumer of
+   `build_streaming_router` is forced to hand-roll the same translation:
+   call `agent.run_stream(...)`, iterate `stream_output(...)` (or
+   `stream_text(...)`), diff against the last emitted prefix to compute a
+   true text delta, emit `text_delta` + `done` + `error`. This is the
+   single biggest copy-paste hazard. A shipping
+   `ballast.adapters.pydantic_ai.make_runner(agent, *,
+   text_field="reply")` would erase ~80 lines of boilerplate per app.
+2. **`_PostMessageBody.parts: list[dict]` has no documented schema.** The
+   router validates "it's a list of dicts" and stops. Every agent_runner
+   re-invents `_extract_user_text(parts)`. Either ship a typed `MessagePart`
+   union (text / tool_result / file_ref) or at least a helper
+   `framework.api.streaming.extract_text(parts) -> str`.
+3. **`AgentRunner` signature is `Callable[..., AsyncIterator[StreamEvent]]`
+   with three named kwargs (`thread_id`, `message`, `tenant_id`) only
+   discoverable by reading `router.py`.** Should be a Protocol class with
+   precise types — mypy currently can't catch a misnamed kwarg in the
+   runner.
+4. **The router persists the user message but never the assistant reply.**
+   After `done`, nothing writes the assistant turn back into the repo, so
+   `GET /threads/{id}/messages` will not contain the LLM output. Either the
+   runner is contractually responsible for `repo.add_message(role="assistant",
+   ...)` after `done` (undocumented), or the router should do it
+   automatically from the `done` event payload.
+5. **`AGUIEncoder` event names (`text_delta`, `done`) are an undocumented
+   contract with the frontend.** There is no `StreamEventKind` enum or
+   docstring saying which kinds the AG-UI encoder will pass through, what
+   assistant-ui expects, or how to extend. Iteration 3 will discover this
+   the hard way.
+6. **Engine boot prints nothing.** A booted-with-no-providers app would be
+   indistinguishable from a misconfigured one in production logs. A single
+   structured log line on boot (`providers=[], invariants=[]`) would help.
+7. **`Engine.fastapi_app()` has no `cors=` or `lifespan_hooks=` knob.** Any
+   real frontend will need CORS configured before the first browser call.
+   Right now I'd have to drop down to mutating the returned `FastAPI`.
+
+## OpenRouter + pydantic-ai notes
+
+The integration is **two-line trivial** in pydantic-ai 1.97.0:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIModel
+from pydantic_ai.providers.openai import OpenAIProvider
+
+provider = OpenAIProvider(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+)
+agent = Agent(
+    model=OpenAIModel("qwen/qwen3.6-plus", provider=provider),
+    output_type=ChatReply,           # pydantic BaseModel
+    system_prompt="You are ...",
+)
+```
+
+- **Structured output for `output_type=ChatReply` is routed through
+  function/tool-calling** on the OpenAI-compatible backend (not
+  `response_format: json_schema`). pydantic-ai registers a synthetic
+  `final_result` tool whose schema matches `ChatReply`. Qwen models on
+  OpenRouter advertise tool-calling, so this works out of the box — no
+  `response_format` shim, no JSON-mode fallback needed.
+- **Streaming under `output_type=BaseModel` uses partial pydantic validation.**
+  `result.stream_output(debounce_by=0.05)` yields progressively-validated
+  `ChatReply` instances as JSON tokens arrive. The `reply` field grows
+  monotonically in the common case, but pydantic's partial mode is allowed
+  to revise (e.g. when a `"` closes a token-truncated string) — our adapter
+  defensively handles that by falling back to a full re-emit if the new
+  value isn't a prefix-extension.
+- **`stream_text(delta=True)` would be simpler but is `str`-output-only.**
+  Pinned to `output_type=ChatReply`, we have to use `stream_output` + diff.
+
+## Stream-event contract emitted by `agent_runner`
+
+| kind         | data shape                              | when                       |
+| ------------ | --------------------------------------- | -------------------------- |
+| `text_delta` | `{"text": "<incremental chunk>"}`       | each partial token group   |
+| `done`       | `{"reply": "<final full reply string>"}`| once, on clean completion  |
+| `error`      | `{"message": "<stringified exception>"}`| once, on any failure       |
+
+Iteration 3 must verify the assistant-ui frontend's AG-UI subscriber
+recognises `text_delta` (it's the AG-UI canonical name) and treats `done`
+as a stream terminator. If assistant-ui expects e.g. `text_message_start` /
+`text_message_content` / `text_message_end` we'll surface that mismatch
+here and either patch the frontend mapping or extend `AGUIEncoder`.
+
+## Framework gaps for iteration 3
+
+- [x] ~~`ballast.adapters.pydantic_ai.make_runner(agent, ...)`
+      that owns the run-stream + diff + emit loop.~~ Landed as
+      `ballast.api.streaming.make_runner` in iteration 2.1.
+- [x] ~~Typed `MessagePart` union for `_PostMessageBody.parts`, plus
+      `extract_text(parts)` helper.~~ Landed in iteration 2.1.
+- [x] ~~`AgentRunner` as a typed `Protocol` (not `Callable[..., ...]`).~~
+      Landed as a `@runtime_checkable` Protocol in iteration 2.1; carries
+      `run_id` alongside `thread_id` / `message` / `tenant_id`.
+- [ ] Auto-persist the assistant reply on `done`, or document the
+      runner's contractual responsibility to call `repo.add_message`.
+      (Tracked as Group C / F7.)
+- [x] ~~`StreamEventKind` constants / enum + table of which kinds each
+      encoder (`AGUIEncoder`, `VercelEncoder`) emits, with
+      assistant-ui compatibility notes.~~ Landed as part of Group A
+      (canonical AG-UI events), expanded by `make_runner` in 2.1.
+- [ ] `Engine.fastapi_app(cors=..., lifespan_hooks=...)`. (Tracked as
+      Group D / F8.)
+- [ ] One structured `INFO` log line on `Engine.boot()`. (Tracked as
+      Group D.)
+
+## Iteration 2.2 update — framework Groups A–D landed (fix round complete)
+
+All four groups of the dogfood-driven framework fix round are now in:
+
+| Group | Commit | Scope |
+| ----- | ------ | ----- |
+| A | `3c71504` | Canonical AG-UI events + `StreamEventKind` enum |
+| B | `01875fd` + `0219412` | `make_runner` adapter, typed `MessagePart`, `AgentRunner` Protocol |
+| C | `00e8040` + `c735e71` | `Thread.title`/`ARCHIVED`, full thread CRUD, auto-persist assistant reply |
+| D | (this commit pair) | `CORSConfig` + lifespan hooks on `Engine.fastapi_app`, verified client-disconnect propagation |
+
+Gap items, final state:
+
+- ~~F1 — pydantic-ai → `StreamEvent` adapter.~~ Landed (B).
+- ~~F2 — typed `MessagePart` union + `extract_text`.~~ Landed (B).
+- ~~F3 — `AgentRunner` Protocol.~~ Landed (B).
+- ~~F4 — assistant reply auto-persistence on `text_message_end`.~~ Landed (C).
+- ~~F5 — `StreamEventKind` enum + encoder coverage table.~~ Landed (A).
+- ~~F6 — boot log line.~~ Landed (C/D auxiliary).
+- ~~F7 — full thread CRUD (list / PATCH / archive / delete).~~ Landed (C).
+- ~~F8 — `cors=` + lifespan hooks on `Engine.fastapi_app()`.~~ Landed (D).
+- ~~F9 — typed `MessagePart` union exported.~~ Landed (B).
+- ~~F10 — verified client-disconnect propagation on streaming endpoint.~~ Landed (D).
+- ~~F11 — assistant reply persistence contract documented.~~ Landed (C).
+
+### F10 abort-propagation finding (recorded for posterity)
+
+Initial hope: a Starlette `StreamingResponse` will receive
+`CancelledError` into its async generator on the next `yield` when the
+client disconnects, and that cancellation will naturally tear down the
+underlying agent runner + httpx request. **This is not reliably the case
+under `httpx.ASGITransport` (and is server-implementation-dependent in
+production too).** We therefore added an explicit
+`request.is_disconnected()` poll loop in `_gen()` that runs concurrently
+with the agent runner; when the client goes away we cancel the producer
+task, which exits `agent.run_stream(...)` and aborts the upstream LLM
+request via pydantic-ai's httpx client. The defensive
+`try/except CancelledError` block remains as a belt-and-braces guard for
+servers that *do* propagate cancellation.
+
+## Iteration 3 — backend (notes domain + agent tools)
+
+### What worked smoothly
+
+- **`@agent.tool` on a method-style coroutine is a one-line ergonomic.**
+  The five CRUD tools were ~12 lines each, and the docstring-as-LLM-prompt
+  contract is exactly the right shape for "model uses tool" wiring.
+- **`Agent[NoteToolDeps, ChatReply]` with `deps_type=NoteToolDeps` is the
+  right boundary.** Per-request deps via `agent.run_stream(prompt, deps=...)`
+  let us inject `(repo, tenant_id)` cleanly without globals.
+- **Splitting `Note` (immutable BaseModel) from `NoteRow` (SQLModel)** keeps
+  the agent-visible payload small and the future Postgres path open.
+  Iteration 4+ can grow the row schema (audit cols, indexes) without
+  leaking into the LLM's tool catalog.
+- **Tools returning the saved `Note`** (not just `"ok"`) gives the model
+  the `id` to chain follow-ups in the same turn. Worth the 4 extra bytes
+  on the wire.
+- **Tenant scoping inside the repo** (rather than at the tool layer) means
+  cross-tenant bugs are impossible at the call site. `update` raises
+  `KeyError` on wrong-tenant; `delete` is idempotent silent no-op (matches
+  HTTP DELETE semantics — and keeps the model from learning about other
+  tenants' notes via error messages).
+
+### Friction points (framework ergonomics gaps surfaced this round)
+
+1. **`make_runner(agent, deps=...)` only accepts a static `deps` value.**
+   Every multi-tenant app will need per-request deps (`tenant_id` from
+   `X-Tenant-Id`, repo from app state). Right now we have to hand-roll the
+   `run_stream → stream_output → diff → emit` loop in `build_notes_runner`
+   to inject fresh `NoteToolDeps` per call, duplicating ~30 lines of the
+   framework adapter.
+
+   **Proposed framework fix (F12):** `make_runner(agent, *, text_field,
+   deps: Any | Callable[..., Any] | Callable[..., Awaitable[Any]] = None)`
+   where if `deps` is callable it's invoked with the runner's kwargs
+   (`thread_id, run_id, message, tenant_id`) per stream. Backwards-compat:
+   non-callable `deps` keeps current behavior.
+
+2. **Tool-call events aren't (yet) surfaced as canonical `StreamEvent`
+   kinds.** The frontend can see the assistant's text reply, but it has no
+   way to render "the model is calling `create_note(...)`" mid-stream.
+   `pydantic-ai`'s iterator does expose tool-call begin/end nodes; we'd
+   want `StreamEvent.tool_call_start / tool_call_args / tool_call_end /
+   tool_result` kinds and a matching `AGUIEncoder` mapping. (Tracked as F13
+   for iteration 4 / HITLGate where this becomes load-bearing.)
+
+3. **No place in the framework for "domain repo + UoW" outside of the
+   built-in thread/persistence subpackages.** Apps that grow a domain
+   (notes, tickets, etc.) re-invent `Protocol + InMemoryImpl + TODO
+   Postgres impl` for every domain. A documented "domain template"
+   (Protocol shape, tenant-scoping conventions, idempotency rules) or even
+   a `ballast.persistence.scaffolds.repository` mini-helper
+   would shorten the iteration-N onboarding.
+
+4. **Module-scope app state for the notes repo feels off.** `build_app()`
+   takes a `notes_repo=` injection, but the module-level `app = build_app()`
+   reuses a process singleton. A real app would want a request-scoped or
+   workflow-scoped factory. The framework's `Engine` could grow a
+   `Container`-style DI hook (`engine.provide(NoteRepository,
+   factory=...)`) so `build_app()` stops being a manual wiring graph.
+
+### Framework gaps to track for next round
+
+- [x] **F12** — `make_runner(deps=...)` accepts a callable / awaitable
+  deps-factory so per-request deps don't force apps to copy the adapter
+  body. *Landed in framework Round 2 / Group E.*
+- [x] **F13** — Canonical `tool_call_*` `StreamEvent` kinds + `AGUIEncoder`
+  mapping, so frontends can render mid-stream tool activity (and so
+  iteration 4's HITLGate has a natural surface to interpose on).
+  *Landed in framework Round 2 / Group E — `make_runner` now drives
+  `agent.iter` and forwards `TOOL_CALL_START` / `TOOL_CALL_ARGS` /
+  `TOOL_CALL_END` per real function-tool call (synthetic `final_result`
+  output-tool calls are suppressed).*
+- [ ] **F14** — Domain-repo scaffold / docs (Protocol conventions,
+  tenant scoping, idempotency rules). Cheap; would shave 30 LOC per
+  domain in dogfood apps.
+- [ ] **F15** — `Engine` DI container hook for app-defined resources
+  (repos, clients) so module-scope singletons stop creeping into
+  `main.py`.
+
+### What we tested
+
+- **Direct unit tests** of `InMemoryNoteRepository` via the registered
+  tools — create persists, search is case-insensitive across title+body,
+  update raises `KeyError` for wrong-tenant, delete is idempotent, list is
+  tenant-scoped. All run without `OPENROUTER_API_KEY`.
+- **Live OpenRouter smoke** asks the model to "Create a note titled
+  'Grocery list' with body 'milk, eggs, bread'." and asserts the in-memory
+  repo has a matching row after `RUN_FINISHED`. Skipped automatically when
+  no key is configured.
+
+## Iteration 2.1 update — framework Groups A + B landed
+
+Group A (canonical AG-UI event kinds) and Group B (the `make_runner`
+adapter + typed `MessagePart` + `AgentRunner` Protocol) are now in. The
+notes-app backend reflects this:
+
+- `notes_app/agent.py` no longer hand-rolls a runner — it just exposes
+  `build_agent()`. The wire-level translation lives in the framework's
+  `make_runner` adapter.
+- `notes_app/main.py` calls `make_runner(build_agent(), text_field="reply")`
+  inside a lazy wrapper (so the app still boots without
+  `OPENROUTER_API_KEY`).
+- `tests/test_smoke.py` asserts the canonical event kinds —
+  `RUN_STARTED` / `TEXT_MESSAGE_CONTENT` / `RUN_FINISHED` — instead of the
+  old `text_delta` / `done`. The `_fake_runner` signature now includes
+  the framework-supplied `run_id` kwarg.
+
+Net effect for consumers: a notes-app-style backend goes from ~80 LOC of
+agent-runner glue to a one-liner. Friction points #1, #2, #3, and #5
+from the iteration-2 list are gone; #4 (assistant reply persistence) and
+#6/#7 (boot log, CORS) remain for Groups C and D.
+
+## Iteration 3 framework round 2 — Group E (F12 + F13) landed
+
+The two iteration-3 friction points (per-request `deps` factory + missing
+tool-call SSE events) are now framework features:
+
+- **F12** — `make_runner(agent, *, text_field, deps=...)` accepts either
+  a static value (legacy) or a callable / coroutine factory invoked with
+  `(thread_id, run_id, message, tenant_id)` per HTTP request.
+- **F13** — `make_runner` switched from `agent.run_stream` to
+  `agent.iter` so it can observe pydantic-ai's per-node events. Text
+  deltas still flow as `TEXT_MESSAGE_CONTENT`; each real function-tool
+  call now also emits `TOOL_CALL_START` → `TOOL_CALL_ARGS` (× N) →
+  `TOOL_CALL_END`. The synthetic `final_result` tool that pydantic-ai
+  uses for structured `output_type=BaseModel` output is suppressed (it's
+  a transport detail — not a tool the frontend should render).
+
+Backend impact: `build_notes_runner` shrank from ~40 LOC of hand-rolled
+`run_stream` + diff loop to a 4-line `deps_factory` closure passed to
+`make_runner(deps=...)`. The notes-app smoke + unit tests pass unchanged.
